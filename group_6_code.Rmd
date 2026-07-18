@@ -1,0 +1,284 @@
+---
+title: "Group 6 Kaggle Project"
+author: "Group 6"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(mgcv)
+library(rpart)
+library(mlr3)
+```
+
+## Load the data
+
+```{r}
+survey <- read_csv("survey_train_test.csv")
+survey |> count(test)
+```
+
+There are 3,027 training survey rows and 2,000 test survey rows.
+
+```{r}
+col_select = c(
+    "Order Date",
+    "Purchase Price Per Unit",
+    "Quantity",
+    "Shipping Address State",
+    "Category",
+    "Survey ResponseID"
+  )
+
+purchases <- read_csv(
+  "amazon-purchases.csv",
+  col_select = all_of(col_select),
+  col_types = cols(
+    `Order Date` = col_date(format = "%Y-%m-%d"),
+    `Purchase Price Per Unit` = col_double(),
+    Quantity = col_double(),
+    `Shipping Address State` = col_character(),
+    Category = col_character(),
+    `Survey ResponseID` = col_character()
+  )
+) |>
+  rename(
+    date = `Order Date`,
+    price = `Purchase Price Per Unit`,
+    quantity = Quantity,
+    ship_state = `Shipping Address State`,
+    category = Category,
+    id = `Survey ResponseID`
+  )
+```
+
+## Explore the data
+
+```{r}
+survey |>
+  filter(!test) |>
+  ggplot(aes(x = factor(Q.amazon.use.hh.size.num))) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    x = "Household size",
+    y = "Number of people",
+    title = "Training response"
+  ) 
+```
+
+Household size is coded as 1, 2, 3, or 4, where 4 means four or more people.
+
+## Clean the data
+
+The dataset paper studies purchases from January 2018 through October 2022 because data collection began in November 2022. Therefore, October 2022 is the last complete month covered for all participants. We will use the same end date.
+
+```{r}
+purchases <- purchases |>
+  mutate(
+    category = replace_na(category, "MISSING")
+  ) |>
+  filter(date <= as.Date("2022-10-31")) |>
+  mutate(
+    spend = price * quantity,
+    weekend = format(date, "%u") %in% c("6", "7"),
+    baby = str_detect(
+      category,
+      "BABY|INFANT|TODDLER|PACIFIER|TEETHER|BREAST_PUMP|BOTTLE_NIPPLE|STROLLER|CRIB"
+    ),
+    toy = str_detect(category, "TOY|PUZZLE|DOLL") & category != "PET_TOY"
+  )
+
+features <- purchases |>
+  group_by(id) |>
+  summarize(
+    n_purchase = n(),
+    total_spend = sum(spend, na.rm = TRUE),
+    n_category = n_distinct(category[category != "MISSING"]),
+    n_state = n_distinct(ship_state, na.rm = TRUE),
+    active_days = as.numeric(max(date) - min(date)) + 1,
+    prop_weekend = mean(weekend),
+    prop_missing_category = mean(category == "MISSING"),
+    n_baby = sum(baby),
+    n_toy = sum(toy),
+    .groups = "drop"
+  ) |>
+  mutate(
+    log_n_purchase = log1p(n_purchase),
+    log_total_spend = log1p(total_spend),
+    log_n_category = log1p(n_category),
+    log_active_days = log1p(active_days),
+    log_n_baby = log1p(n_baby),
+    log_n_toy = log1p(n_toy)
+  ) |>
+  select(
+    id, log_n_purchase, log_total_spend, log_n_category,
+    log_active_days, n_state, prop_weekend, prop_missing_category,
+    log_n_baby, log_n_toy
+  )
+```
+
+## Modeling
+
+Only gender and state are observed for both the training and test survey rows.
+States with fewer than 30 training rows are combined into an `Other` group.
+
+```{r}
+survey_small <- survey |>
+  mutate(
+    id = Survey.ResponseID,
+    y = Q.amazon.use.hh.size.num,
+    gender = Q.demos.gender,
+    state = Q.demos.state
+  ) |>
+  select(id, y, gender, state, test)
+
+keep_state <- survey_small |>
+  filter(!test) |>
+  count(state) |>
+  filter(n >= 30) |>
+  pull(state)
+
+survey_small <- survey_small |>
+  mutate(
+    gender = ifelse(
+      gender %in% c("Female", "Male"),
+      as.character(gender),
+      "Other"
+    ),
+    state = ifelse(
+      state %in% keep_state,
+      as.character(state),
+      "Other"
+    ),
+    gender = factor(gender),
+    state = factor(state)
+  )
+
+feature_names <- setdiff(names(features), "id")
+
+model_data <- survey_small |>
+  left_join(features, by = "id") |>
+  mutate(across(all_of(feature_names), ~ replace_na(.x, 0)))
+
+train_data <- model_data |>
+  filter(!test) |>
+  select(-id, -test)
+
+test_data <- model_data |>
+  filter(test)
+```
+
+## Predictions
+
+```{r}
+lm_formula <- y ~ gender + state + log_n_purchase + log_total_spend +
+  log_n_category + log_active_days + n_state + prop_weekend +
+  prop_missing_category + log_n_baby + log_n_toy
+
+gam_formula <- y ~ gender + state +
+  s(log_n_purchase, k = 5) +
+  s(log_total_spend, k = 5) +
+  s(log_n_category, k = 5) +
+  s(log_active_days, k = 5) +
+  s(n_state, k = 4) +
+  prop_weekend + prop_missing_category +
+  s(log_n_baby, k = 5) +
+  s(log_n_toy, k = 5)
+
+rmse <- function(truth, prediction) {
+  sqrt(mean((truth - prediction)^2))
+}
+```
+
+```{r}
+set.seed(101)
+
+task <- as_task_regr(train_data, target = "y")
+
+cv_10fold <- rsmp("cv", folds = 10)
+cv_10fold$instantiate(task)
+
+k <- cv_10fold$iters
+
+model_names <- c(
+  "Baseline", "Linear regression", "GAM", "Regression tree"
+)
+cv_error <- matrix(NA, nrow = k, ncol = length(model_names))
+
+for (i in 1:k) {
+  train_fold <- train_data[cv_10fold$train_set(i), ]
+  valid_fold <- train_data[cv_10fold$test_set(i), ]
+
+  mean_prediction <- rep(mean(train_fold$y), nrow(valid_fold))
+
+  lm_fit <- lm(lm_formula, data = train_fold)
+  lm_prediction <- predict(lm_fit, newdata = valid_fold)
+
+  gam_fit <- mgcv::gam(gam_formula, data = train_fold, method = "REML")
+  gam_prediction <- predict(gam_fit, newdata = valid_fold)
+
+  tree_fit <- rpart(lm_formula, data = train_fold, method = "anova")
+  tree_prediction <- predict(tree_fit, newdata = valid_fold)
+
+  predictions <- list(
+    mean_prediction,
+    lm_prediction,
+    gam_prediction,
+    tree_prediction
+  )
+
+  for (j in 1:length(model_names)) {
+    cv_error[i, j] <- rmse(valid_fold$y, predictions[[j]])
+  }
+}
+
+cv_results <- tibble(
+  model = factor(model_names, levels = model_names),
+  rmse = colMeans(cv_error)
+)
+
+cv_results
+```
+
+```{r}
+cv_results |>
+  ggplot(aes(x = model, y = rmse)) +
+  geom_col(fill = "steelblue") +
+  coord_cartesian(ylim = c(1, max(cv_results$rmse) + 0.01)) +
+  labs(
+    x = NULL,
+    y = "10-fold CV RMSE",
+    title = "Model comparison"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+The GAM has the smallest cross-validation RMSE.
+
+## Fit the final model and make the submission
+
+```{r}
+final_fit <- mgcv::gam(gam_formula, data = train_data, method = "REML")
+
+test_prediction <- as.numeric(
+  predict(final_fit, newdata = test_data)
+)
+
+submission <- read_csv(
+  "sample_sol.csv"
+)
+
+stopifnot(identical(submission$Survey.ResponseID, test_data$id))
+
+submission$Q.amazon.use.hh.size.num <- test_prediction
+
+write_csv(submission, "group_6_submission.csv")
+
+head(submission)
+```
