@@ -261,6 +261,70 @@ cv_results |>
 
 The GAM has the smallest cross-validation RMSE.
 
+GAM performed best with the current features, so we further examine whether the GAM can be improved.
+
+```{r}
+original_gam_fit <- mgcv::gam(
+  gam_formula,
+  data = train_data,
+  method = "REML"
+)
+
+summary(original_gam_fit)
+```
+
+The edf values for `log_total_spend` and `log_n_category` are close to 1, so we use linear terms for these variables.
+
+```{r}
+updated_gam_formula <- y ~ gender + state +
+  s(log_n_purchase, k = 5) +
+  log_total_spend +
+  log_n_category +
+  s(log_active_days, k = 5) +
+  s(n_state, k = 4) +
+  prop_weekend + prop_missing_category +
+  s(log_n_baby, k = 5) +
+  s(log_n_toy, k = 5)
+```
+
+Let's compare the original and updated GAM.
+
+```{r}
+updated_cv_error <- rep(NA, k)
+
+for (i in 1:k) {
+  train_fold <- train_data[cv_10fold$train_set(i), ]
+  valid_fold <- train_data[cv_10fold$test_set(i), ]
+
+  updated_gam_fit <- mgcv::gam(
+    updated_gam_formula,
+    data = train_fold,
+    method = "REML"
+  )
+  updated_prediction <- predict(updated_gam_fit, newdata = valid_fold)
+
+  updated_cv_error[i] <- rmse(valid_fold$y, updated_prediction)
+}
+
+original_gam_rmse <- cv_results$rmse[cv_results$model == "GAM"]
+updated_gam_rmse <- mean(updated_cv_error)
+
+gam_cv_results <- data.frame(
+  model = c("Original GAM", "Updated GAM"),
+  rmse = round(c(original_gam_rmse, updated_gam_rmse), 6)
+)
+
+gam_cv_results
+```
+
+The updated GAM has a slightly lower CV RMSE, it works!
+
+```{r}
+if (updated_gam_rmse < original_gam_rmse) {
+  gam_formula <- updated_gam_formula
+}
+```
+
 ## Fit the final model and make the submission
 
 ```{r}
