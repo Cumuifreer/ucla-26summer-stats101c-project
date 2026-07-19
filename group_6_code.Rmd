@@ -361,14 +361,261 @@ model_results |>
 
 The GAM is still the winner!
 
+Let's try adding some new features.
+
+```{r}
+product_features_v2 <- read_csv(
+  "amazon-purchases.csv",
+  col_select = c(
+    "Order Date", "ASIN/ISBN (Product Code)", "Survey ResponseID"
+  ),
+  col_types = cols(
+    `Order Date` = col_date(format = "%Y-%m-%d"),
+    `ASIN/ISBN (Product Code)` = col_character(),
+    `Survey ResponseID` = col_character()
+  )
+) |>
+  rename(
+    date = `Order Date`,
+    product = `ASIN/ISBN (Product Code)`,
+    id = `Survey ResponseID`
+  ) |>
+  filter(
+    date <= as.Date("2022-10-31"),
+    !is.na(product)
+  ) |>
+  group_by(id) |>
+  summarize(
+    n_product = n_distinct(product),
+    n_product_rows = n(),
+    .groups = "drop"
+  ) |>
+  mutate(
+    log_n_product = log1p(n_product),
+    prop_repeat = 1 - n_product / n_product_rows
+  ) |>
+  select(id, log_n_product, prop_repeat)
+
+category_features_v2 <- purchases |>
+  filter(category != "MISSING") |>
+  count(id, category, name = "category_n") |>
+  group_by(id) |>
+  summarize(
+    top_category_prop = max(category_n) / sum(category_n),
+    .groups = "drop"
+  )
+
+features_v2 <- purchases |>
+  mutate(
+    month = format(date, "%Y-%m"),
+    food = category %in% c("FOOD", "GROCERY", "VEGETABLE", "FRUIT"),
+    health = category %in% c(
+      "HEALTH_PERSONAL_CARE", "MEDICATION", "VITAMIN"
+    ),
+    pet = category %in% c("PET_FOOD", "PET_SUPPLIES")
+  ) |>
+  group_by(id) |>
+  summarize(
+    active_months = n_distinct(month),
+    mean_price = mean(price, na.rm = TRUE),
+    mean_quantity = mean(quantity, na.rm = TRUE),
+    prop_multi = mean(quantity > 1, na.rm = TRUE),
+    purchases_per_month = n() / active_months,
+    purchase_days = n_distinct(date),
+    prop_baby = mean(baby),
+    prop_toy = mean(toy),
+    n_food = sum(food),
+    prop_food = mean(food),
+    n_health = sum(health),
+    prop_health = mean(health),
+    n_pet = sum(pet),
+    prop_pet = mean(pet),
+    .groups = "drop"
+  ) |>
+  mutate(
+    log_active_months = log1p(active_months),
+    log_mean_price = log1p(mean_price),
+    log_purchases_per_month = log1p(purchases_per_month),
+    log_purchase_days = log1p(purchase_days),
+    log_n_food = log1p(n_food),
+    log_n_health = log1p(n_health),
+    log_n_pet = log1p(n_pet)
+  ) |>
+  select(
+    id, log_active_months, log_mean_price, mean_quantity,
+    prop_multi, log_purchases_per_month, log_purchase_days,
+    prop_baby, prop_toy, log_n_food, prop_food,
+    log_n_health, prop_health, log_n_pet, prop_pet
+  ) |>
+  left_join(product_features_v2, by = "id") |>
+  left_join(category_features_v2, by = "id")
+
+new_names <- setdiff(names(features_v2), "id")
+
+model_data_v2 <- model_data |>
+  left_join(features_v2, by = "id") |>
+  mutate(across(all_of(new_names), ~ replace_na(.x, 0)))
+
+train_data_v2 <- model_data_v2 |>
+  filter(!test) |>
+  select(-id, -test)
+```
+
+```{r}
+gam_formula_v2 <- y ~ gender + state +
+  s(log_n_purchase, k = 5) +
+  s(log_total_spend, k = 5) +
+  s(log_n_category, k = 5) +
+  s(log_active_days, k = 5) +
+  s(n_state, k = 4) +
+  s(log_n_baby, k = 5) +
+  s(log_n_toy, k = 5) +
+  prop_weekend + prop_missing_category +
+  log_active_months + log_mean_price + mean_quantity +
+  prop_multi + log_purchases_per_month + log_purchase_days +
+  log_n_product + prop_repeat + top_category_prop +
+  prop_baby + prop_toy + log_n_food + prop_food +
+  log_n_health + prop_health + log_n_pet + prop_pet
+
+mod_mat_v2 <- model.matrix(~ ., data = train_data_v2)
+num_data_v2 <- as.data.frame(mod_mat_v2[, -1])
+
+ridge_fit_v2 <- lrn(
+  "regr.cv_glmnet",
+  alpha = 0,
+  nfolds = 10,
+  s = "lambda.min",
+  lambda = 10^seq(from = -1.5, to = 1.5, by = 0.1),
+  standardize = TRUE
+)
+
+lasso_fit_v2 <- lrn(
+  "regr.cv_glmnet",
+  alpha = 1,
+  nfolds = 10,
+  s = "lambda.min",
+  lambda = 10^seq(from = -2, to = 2, by = 0.1),
+  standardize = TRUE
+)
+
+rf_fit_v2 <- lrn("regr.ranger", importance = "impurity")
+
+xgb_fit_v2 <- as_learner(
+  po("encode", method = "one-hot") %>>%
+    lrn(
+      "regr.xgboost",
+      max_depth = 2,
+      eta = 0.01,
+      nrounds = 1000,
+      min_child_weight = 30,
+      subsample = 0.75,
+      colsample_bytree = 0.65,
+      lambda = 15,
+      alpha = 0.5
+    )
+)
+```
+
+```{r}
+set.seed(101)
+
+v2_cv_error <- matrix(NA, nrow = k, ncol = 5)
+
+for (i in 1:k) {
+  train_id <- cv_10fold$train_set(i)
+  valid_id <- cv_10fold$test_set(i)
+
+  train_fold_v2 <- train_data_v2[train_id, ]
+  valid_fold_v2 <- train_data_v2[valid_id, ]
+  train_num_v2 <- num_data_v2[train_id, ]
+  valid_num_v2 <- num_data_v2[valid_id, ]
+
+  train_task_v2 <- as_task_regr(train_fold_v2, target = "y")
+  num_task_v2 <- as_task_regr(train_num_v2, target = "y")
+
+  gam_fit_v2 <- mgcv::gam(
+    gam_formula_v2,
+    data = train_fold_v2,
+    method = "REML"
+  )
+  gam_pred_v2 <- predict(gam_fit_v2, newdata = valid_fold_v2)
+
+  ridge_fit_v2$train(task = num_task_v2)
+  ridge_pred_v2 <- ridge_fit_v2$predict_newdata(
+    newdata = valid_num_v2
+  )$response
+
+  lasso_fit_v2$train(task = num_task_v2)
+  lasso_pred_v2 <- lasso_fit_v2$predict_newdata(
+    newdata = valid_num_v2
+  )$response
+
+  rf_fit_v2$train(task = train_task_v2)
+  rf_pred_v2 <- rf_fit_v2$predict_newdata(
+    newdata = valid_fold_v2
+  )$response
+
+  xgb_fit_v2$train(task = train_task_v2)
+  xgb_pred_v2 <- xgb_fit_v2$predict_newdata(
+    newdata = valid_fold_v2
+  )$response
+
+  v2_cv_error[i, ] <- c(
+    rmse(valid_fold_v2$y, gam_pred_v2),
+    rmse(valid_fold_v2$y, ridge_pred_v2),
+    rmse(valid_fold_v2$y, lasso_pred_v2),
+    rmse(valid_fold_v2$y, rf_pred_v2),
+    rmse(valid_fold_v2$y, xgb_pred_v2)
+  )
+}
+```
+
+```{r}
+v2_names <- c(
+  "GAM", "GAM v2", "Ridge v2", "Lasso v2",
+  "Random Forest v2", "XGBoost v2"
+)
+
+v2_rmse <- colMeans(v2_cv_error)
+
+model_results_v2 <- data.frame(
+  model = factor(v2_names, levels = v2_names),
+  rmse = round(c(gam_rmse, v2_rmse), 6)
+)
+
+model_results_v2
+```
+
+```{r}
+model_results_v2 |>
+  ggplot(aes(x = model, y = rmse)) +
+  geom_col(fill = "steelblue") +
+  coord_cartesian(ylim = c(1, max(model_results_v2$rmse) + 0.01)) +
+  labs(
+    x = NULL,
+    y = "10-fold CV RMSE",
+    title = "Model comparison"
+  )
+```
+
+XGBoost v2 has the lowest CV RMSE.
+
 ## Fit the final model and make the submission
 
 ```{r}
-final_fit <- mgcv::gam(gam_formula, data = train_data, method = "REML")
+set.seed(101)
 
-test_prediction <- as.numeric(
-  predict(final_fit, newdata = test_data)
-)
+test_data_v2 <- model_data_v2 |>
+  filter(test) |>
+  select(-id, -test, -y)
+
+final_task <- as_task_regr(train_data_v2, target = "y")
+
+xgb_fit_v2$train(task = final_task)
+
+test_prediction <- xgb_fit_v2$predict_newdata(
+  newdata = test_data_v2
+)$response
 
 submission <- read_csv(
   "sample_sol.csv"
