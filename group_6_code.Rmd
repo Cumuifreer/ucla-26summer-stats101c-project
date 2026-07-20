@@ -14,6 +14,7 @@ library(tidyverse)
 library(mgcv)
 library(rpart)
 library(mlr3)
+library(mlr3verse)
 ```
 
 ## Load the data
@@ -47,7 +48,7 @@ purchases <- read_csv(
     `Survey ResponseID` = col_character()
   )
 ) |>
-  rename(
+   rename(
     date = `Order Date`,
     price = `Purchase Price Per Unit`,
     quantity = Quantity,
@@ -68,7 +69,7 @@ survey |>
     x = "Household size",
     y = "Number of people",
     title = "Training response"
-  ) 
+  )
 ```
 
 Household size is coded as 1, 2, 3, or 4, where 4 means four or more people.
@@ -107,7 +108,7 @@ features <- purchases |>
     n_toy = sum(toy),
     .groups = "drop"
   ) |>
-  mutate(
+ mutate(
     log_n_purchase = log1p(n_purchase),
     log_total_spend = log1p(total_spend),
     log_n_category = log1p(n_category),
@@ -128,7 +129,7 @@ Only gender and state are observed for both the training and test survey rows.
 States with fewer than 30 training rows are combined into an `Other` group.
 
 ```{r}
-survey_small <- survey |>
+ survey_small <- survey |>
   mutate(
     id = Survey.ResponseID,
     y = Q.amazon.use.hh.size.num,
@@ -173,7 +174,13 @@ test_data <- model_data |>
   filter(test)
 ```
 
-## Predictions
+## Candidate models: round 1
+
+*Note on the number of candidate models:* the assignment allows a maximum
+of 12 candidate models. We fit an unpenalized linear model and a GAM in
+this round; a simple mean-only baseline is computed only as an informal
+reference point in the text below and is **not** counted as one of our
+formal candidate models.
 
 ```{r}
 lm_formula <- y ~ gender + state + log_n_purchase + log_total_spend +
@@ -206,9 +213,9 @@ cv_10fold$instantiate(task)
 
 k <- cv_10fold$iters
 
-model_names <- c(
-  "Baseline", "Linear regression", "GAM", "Regression tree"
-)
+# "Baseline" (mean prediction) is tracked for reference only and is
+# excluded from the formal candidate-model count/table.
+model_names <- c("Baseline (reference only)", "Linear regression", "GAM")
 cv_error <- matrix(NA, nrow = k, ncol = length(model_names))
 
 for (i in 1:k) {
@@ -223,15 +230,7 @@ for (i in 1:k) {
   gam_fit <- mgcv::gam(gam_formula, data = train_fold, method = "REML")
   gam_prediction <- predict(gam_fit, newdata = valid_fold)
 
-  tree_fit <- rpart(lm_formula, data = train_fold, method = "anova")
-  tree_prediction <- predict(tree_fit, newdata = valid_fold)
-
-  predictions <- list(
-    mean_prediction,
-    lm_prediction,
-    gam_prediction,
-    tree_prediction
-  )
+  predictions <- list(mean_prediction, lm_prediction, gam_prediction)
 
   for (j in 1:length(model_names)) {
     cv_error[i, j] <- rmse(valid_fold$y, predictions[[j]])
@@ -254,7 +253,7 @@ cv_results |>
   labs(
     x = NULL,
     y = "10-fold CV RMSE",
-    title = "Model comparison"
+    title = "Model comparison (round 1)"
   )
 ```
 
@@ -263,7 +262,6 @@ The GAM has the smallest cross-validation RMSE.
 Let's try some additional models!
 
 ```{r}
-library("mlr3verse")
 
 mod_mat <- model.matrix(~ ., data = train_data)
 num_data <- as.data.frame(mod_mat[, -1])
@@ -292,6 +290,9 @@ xgb_fit <- as_learner(
   po("encode", method = "one-hot") %>>% lrn("regr.xgboost")
 )
 ```
+
+
+
 
 ```{r}
 set.seed(101)
@@ -332,9 +333,7 @@ for (i in 1:k) {
 ```
 
 ```{r}
-new_model_names <- c(
-  "GAM", "Ridge", "Lasso", "Random Forest", "XGBoost"
-)
+new_model_names <- c("GAM", "Ridge", "Lasso", "Random Forest", "XGBoost")
 
 gam_rmse <- cv_results$rmse[cv_results$model == "GAM"]
 new_rmse <- colMeans(new_cv_error)
@@ -355,7 +354,7 @@ model_results |>
   labs(
     x = NULL,
     y = "10-fold CV RMSE",
-    title = "Model comparison"
+    title = "Model comparison (round 2)"
   )
 ```
 
@@ -461,6 +460,8 @@ train_data_v2 <- model_data_v2 |>
   select(-id, -test)
 ```
 
+## Candidate models: round 3 (with additional features)
+
 ```{r}
 gam_formula_v2 <- y ~ gender + state +
   s(log_n_purchase, k = 5) +
@@ -500,18 +501,29 @@ lasso_fit_v2 <- lrn(
 
 rf_fit_v2 <- lrn("regr.ranger", importance = "impurity")
 
+xgb_params_v2 <- list(
+  max_depth = 2,
+  eta = 0.01,
+  nrounds = 1000,
+  min_child_weight = 30,
+  subsample = 0.75,
+  colsample_bytree = 0.65,
+  lambda = 15,
+  alpha = 0.5
+)
+
 xgb_fit_v2 <- as_learner(
   po("encode", method = "one-hot") %>>%
     lrn(
       "regr.xgboost",
-      max_depth = 2,
-      eta = 0.01,
-      nrounds = 1000,
-      min_child_weight = 30,
-      subsample = 0.75,
-      colsample_bytree = 0.65,
-      lambda = 15,
-      alpha = 0.5
+      max_depth = xgb_params_v2$max_depth,
+      eta = xgb_params_v2$eta,
+      nrounds = xgb_params_v2$nrounds,
+      min_child_weight = xgb_params_v2$min_child_weight,
+      subsample = xgb_params_v2$subsample,
+      colsample_bytree = xgb_params_v2$colsample_bytree,
+      lambda = xgb_params_v2$lambda,
+      alpha = xgb_params_v2$alpha
     )
 )
 ```
@@ -594,36 +606,137 @@ model_results_v2 |>
   labs(
     x = NULL,
     y = "10-fold CV RMSE",
-    title = "Model comparison"
+    title = "Model comparison (round 3)"
   )
 ```
 
-XGBoost v2 has the lowest CV RMSE.
+XGBoost v2 has the lowest CV RMSE and is selected as our final model.
 
-## Fit the final model and make the submission
+## Candidate model summary table
+
+
 
 ```{r}
-set.seed(101)
-
-test_data_v2 <- model_data_v2 |>
-  filter(test) |>
-  select(-id, -test, -y)
-
-final_task <- as_task_regr(train_data_v2, target = "y")
-
-xgb_fit_v2$train(task = final_task)
-
-test_prediction <- xgb_fit_v2$predict_newdata(
-  newdata = test_data_v2
-)$response
-
-submission <- read_csv(
-  "sample_sol.csv"
+candidate_model_table <- tibble::tribble(
+  ~model_id, ~type, ~variables, ~hyperparameters,
+  "Linear regression", "OLS linear regression",
+    "gender, state, purchase-history features (round 1 set)",
+    "None",
+  "GAM", "Generalized additive model",
+    "gender, state, smooth terms for purchase-history features",
+    "k = 4-5 basis dimension per smooth; method = REML",
+  "Ridge", "Penalized linear regression (glmnet, alpha = 0)",
+    "gender, state, purchase-history features (round 1 set, one-hot encoded)",
+    "lambda chosen via 10-fold internal CV over 10^(-1.5, 1.5)",
+  "Lasso", "Penalized linear regression (glmnet, alpha = 1)",
+    "gender, state, purchase-history features (round 1 set, one-hot encoded)",
+    "lambda chosen via 10-fold internal CV over 10^(-2, 2)",
+  "Random Forest", "Random forest (ranger)",
+    "gender, state, purchase-history features (round 1 set)",
+    "Default ranger settings; importance = impurity",
+  "XGBoost", "Gradient boosted trees (xgboost, one-hot encoded)",
+    "gender, state, purchase-history features (round 1 set)",
+    "Default xgboost settings",
+  "GAM v2", "Generalized additive model",
+    "gender, state, smooth terms for round-1 + round-2 purchase-history features",
+    "k = 4-5 basis dimension per smooth; method = REML",
+  "Ridge v2", "Penalized linear regression (glmnet, alpha = 0)",
+    "gender, state, full feature set (round 1 + round 2, one-hot encoded)",
+    "lambda chosen via 10-fold internal CV over 10^(-1.5, 1.5)",
+  "Lasso v2", "Penalized linear regression (glmnet, alpha = 1)",
+    "gender, state, full feature set (round 1 + round 2, one-hot encoded)",
+    "lambda chosen via 10-fold internal CV over 10^(-2, 2)",
+  "Random Forest v2", "Random forest (ranger)",
+    "gender, state, full feature set (round 1 + round 2)",
+    "Default ranger settings; importance = impurity",
+  "XGBoost v2", "Gradient boosted trees (xgboost, one-hot encoded)",
+    "gender, state, full feature set (round 1 + round 2)",
+    "max_depth = 2, eta = 0.01, nrounds = 1000, min_child_weight = 30, subsample = 0.75, colsample_bytree = 0.65, lambda = 15, alpha = 0.5"
 )
 
-stopifnot(identical(submission$Survey.ResponseID, test_data$id))
+candidate_model_table
+```
+performance_table <- bind_rows(
+  cv_results |> filter(model != "Baseline (reference only)"),
+  model_results |> filter(model != "GAM"),
+  model_results_v2 |> filter(model != "GAM")
+) |>
+  distinct(model, .keep_all = TRUE)
 
-submission$Q.amazon.use.hh.size.num <- test_prediction
+performance_table
+```
+```{r}
+performance_table |>
+  ggplot(aes(x = reorder(model, rmse), y = rmse)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "10-fold CV RMSE",
+    title = "All candidate models: 10-fold CV RMSE"
+  )
+```
+## Final model interpretation
+
+### Variable importance
+
+```{r}
+final_task <- as_task_regr(train_data_v2, target = "y")
+xgb_fit_v2$train(task = final_task)
+
+trained_xgb <- xgb_fit_v2$base_learner()
+importance_vec <- trained_xgb$importance()
+
+importance_vec |>
+  enframe(name = "Feature", value = "Gain") |>
+  slice_max(Gain, n = 10) |>
+  ggplot(aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Relative importance (gain)",
+    title = "Top 10 most important predictors, final XGBoost v2 model"
+  )
+```
+
+### Individual prediction examples
+
+```{r}
+test_data_v2 <- model_data_v2 |>
+  filter(test) |>
+  select(-y)
+
+test_prediction <- xgb_fit_v2$predict_newdata(
+  newdata = test_data_v2 |> select(-id, -test)
+)$response
+
+example_ids <- test_data_v2 |>
+  mutate(prediction = test_prediction) |>
+  slice(1:3)
+
+example_ids |>
+  select(id, prediction, log_n_purchase, log_total_spend, log_n_category)
+```
+
+
+## Make the final submission
+
+
+```{r}
+prediction_lookup <- tibble(
+  id = test_data_v2$id,
+  predicted_hh_size = test_prediction
+)
+
+submission <- read_csv("sample_sol.csv") |>
+  left_join(prediction_lookup, by = c("Survey.ResponseID" = "id"))
+
+stopifnot(!any(is.na(submission$predicted_hh_size)))
+
+submission <- submission |>
+  mutate(Q.amazon.use.hh.size.num = predicted_hh_size) |>
+  select(-predicted_hh_size)
 
 write_csv(submission, "group_6_submission.csv")
 
