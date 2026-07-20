@@ -73,7 +73,126 @@ survey |>
 ```
 
 Household size is coded as 1, 2, 3, or 4, where 4 means four or more people.
+```{r}
 
+dir.create("figures", showWarnings = FALSE)
+
+# Build a training-only frame that has both the raw/derived features and
+# the response, since train_data (used for modeling) has already dropped
+# id/test but keeps y -- this is exactly what we want here.
+eda_data <- train_data
+
+# --- Figure 2: distribution of number of purchases -----------------------
+p2 <- eda_data |>
+  ggplot(aes(x = log_n_purchase)) +
+  geom_histogram(fill = "steelblue", bins = 30) +
+  labs(
+    x = "log(1 + number of purchases)",
+    y = "Count",
+    title = "Distribution of purchase counts"
+  )
+ggsave("figures/fig2_log_n_purchase_hist.png", p2, width = 6, height = 4)
+p2
+
+# --- Figure 3: distribution of total spend --------------------------------
+p3 <- eda_data |>
+  ggplot(aes(x = log_total_spend)) +
+  geom_histogram(fill = "steelblue", bins = 30) +
+  labs(
+    x = "log(1 + total spend)",
+    y = "Count",
+    title = "Distribution of total spend"
+  )
+ggsave("figures/fig3_log_total_spend_hist.png", p3, width = 6, height = 4)
+p3
+
+# --- Figure 4: number of purchases vs. household size ---------------------
+p4 <- eda_data |>
+  ggplot(aes(x = factor(y), y = log_n_purchase)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(
+    x = "Household size",
+    y = "log(1 + number of purchases)",
+    title = "Purchase count by household size"
+  )
+ggsave("figures/fig4_purchases_by_hh_size.png", p4, width = 6, height = 4)
+p4
+
+# --- Figure 5: total spend vs. household size ------------------------------
+p5 <- eda_data |>
+  ggplot(aes(x = factor(y), y = log_total_spend)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(
+    x = "Household size",
+    y = "log(1 + total spend)",
+    title = "Total spend by household size"
+  )
+ggsave("figures/fig5_spend_by_hh_size.png", p5, width = 6, height = 4)
+p5
+
+# --- Figure 6: gender distribution + gender vs. household size ------------
+p6 <- eda_data |>
+  ggplot(aes(x = gender, fill = factor(y))) +
+  geom_bar(position = "fill") +
+  labs(
+    x = "Gender",
+    y = "Proportion",
+    fill = "Household\nsize",
+    title = "Household size distribution by gender"
+  )
+ggsave("figures/fig6_gender_vs_hh_size.png", p6, width = 6, height = 4)
+p6
+
+# --- Figure 7: state distribution (top states) -----------------------------
+p7 <- eda_data |>
+  count(state) |>
+  slice_max(n, n = 10) |>
+  ggplot(aes(x = reorder(state, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Number of training observations",
+    title = "Top 10 states by number of observations"
+  )
+ggsave("figures/fig7_top_states.png", p7, width = 6, height = 4)
+p7
+
+# --- Figure 8: baby/toy purchase proportion vs. household size ------------
+p8a <- eda_data |>
+  ggplot(aes(x = factor(y), y = log_n_toy)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(
+    x = "Household size",
+    y = "log(1 + number of toy purchases)",
+    title = "Toy purchases by household size"
+  )
+ggsave("figures/fig8a_toy_by_hh_size.png", p8a, width = 6, height = 4)
+p8a
+
+p8b <- eda_data |>
+  ggplot(aes(x = factor(y), y = log_n_baby)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(
+    x = "Household size",
+    y = "log(1 + number of baby-item purchases)",
+    title = "Baby-item purchases by household size"
+  )
+ggsave("figures/fig8b_baby_by_hh_size.png", p8b, width = 6, height = 4)
+p8b
+
+# --- Figure (bonus): number of distinct categories vs. household size ----
+p9 <- eda_data |>
+  ggplot(aes(x = factor(y), y = log_n_category)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(
+    x = "Household size",
+    y = "log(1 + number of distinct categories)",
+    title = "Category diversity by household size"
+  )
+ggsave("figures/fig9_category_diversity_by_hh_size.png", p9, width = 6, height = 4)
+p9
+```
 ## Clean the data
 
 The dataset paper studies purchases from January 2018 through October 2022 because data collection began in November 2022. Therefore, October 2022 is the last complete month covered for all participants. We will use the same end date.
