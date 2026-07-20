@@ -73,8 +73,108 @@ survey |>
 ```
 
 Household size is coded as 1, 2, 3, or 4, where 4 means four or more people.
-```{r}
 
+```
+## Clean the data
+
+The dataset paper studies purchases from January 2018 through October 2022 because data collection began in November 2022. Therefore, October 2022 is the last complete month covered for all participants. We will use the same end date.
+
+```{r}
+purchases <- purchases |>
+  mutate(
+    category = replace_na(category, "MISSING")
+  ) |>
+  filter(date <= as.Date("2022-10-31")) |>
+  mutate(
+    spend = price * quantity,
+    weekend = format(date, "%u") %in% c("6", "7"),
+    baby = str_detect(
+      category,
+      "BABY|INFANT|TODDLER|PACIFIER|TEETHER|BREAST_PUMP|BOTTLE_NIPPLE|STROLLER|CRIB"
+    ),
+    toy = str_detect(category, "TOY|PUZZLE|DOLL") & category != "PET_TOY"
+  )
+
+features <- purchases |>
+  group_by(id) |>
+  summarize(
+    n_purchase = n(),
+    total_spend = sum(spend, na.rm = TRUE),
+    n_category = n_distinct(category[category != "MISSING"]),
+    n_state = n_distinct(ship_state, na.rm = TRUE),
+    active_days = as.numeric(max(date) - min(date)) + 1,
+    prop_weekend = mean(weekend),
+    prop_missing_category = mean(category == "MISSING"),
+    n_baby = sum(baby),
+    n_toy = sum(toy),
+    .groups = "drop"
+  ) |>
+ mutate(
+    log_n_purchase = log1p(n_purchase),
+    log_total_spend = log1p(total_spend),
+    log_n_category = log1p(n_category),
+    log_active_days = log1p(active_days),
+    log_n_baby = log1p(n_baby),
+    log_n_toy = log1p(n_toy)
+  ) |>
+  select(
+    id, log_n_purchase, log_total_spend, log_n_category,
+    log_active_days, n_state, prop_weekend, prop_missing_category,
+    log_n_baby, log_n_toy
+  )
+```
+
+## Modeling
+
+Only gender and state are observed for both the training and test survey rows.
+States with fewer than 30 training rows are combined into an `Other` group.
+
+```{r}
+ survey_small <- survey |>
+  mutate(
+    id = Survey.ResponseID,
+    y = Q.amazon.use.hh.size.num,
+    gender = Q.demos.gender,
+    state = Q.demos.state
+  ) |>
+  select(id, y, gender, state, test)
+
+keep_state <- survey_small |>
+  filter(!test) |>
+  count(state) |>
+  filter(n >= 30) |>
+  pull(state)
+
+survey_small <- survey_small |>
+  mutate(
+    gender = ifelse(
+      gender %in% c("Female", "Male"),
+      as.character(gender),
+      "Other"
+    ),
+    state = ifelse(
+      state %in% keep_state,
+      as.character(state),
+      "Other"
+    ),
+    gender = factor(gender),
+    state = factor(state)
+  )
+
+feature_names <- setdiff(names(features), "id")
+
+model_data <- survey_small |>
+  left_join(features, by = "id") |>
+  mutate(across(all_of(feature_names), ~ replace_na(.x, 0)))
+
+train_data <- model_data |>
+  filter(!test) |>
+  select(-id, -test)
+
+test_data <- model_data |>
+  filter(test)
+```
+```
 dir.create("figures", showWarnings = FALSE)
 
 # Build a training-only frame that has both the raw/derived features and
@@ -193,106 +293,6 @@ p9 <- eda_data |>
 ggsave("figures/fig9_category_diversity_by_hh_size.png", p9, width = 6, height = 4)
 p9
 ```
-## Clean the data
-
-The dataset paper studies purchases from January 2018 through October 2022 because data collection began in November 2022. Therefore, October 2022 is the last complete month covered for all participants. We will use the same end date.
-
-```{r}
-purchases <- purchases |>
-  mutate(
-    category = replace_na(category, "MISSING")
-  ) |>
-  filter(date <= as.Date("2022-10-31")) |>
-  mutate(
-    spend = price * quantity,
-    weekend = format(date, "%u") %in% c("6", "7"),
-    baby = str_detect(
-      category,
-      "BABY|INFANT|TODDLER|PACIFIER|TEETHER|BREAST_PUMP|BOTTLE_NIPPLE|STROLLER|CRIB"
-    ),
-    toy = str_detect(category, "TOY|PUZZLE|DOLL") & category != "PET_TOY"
-  )
-
-features <- purchases |>
-  group_by(id) |>
-  summarize(
-    n_purchase = n(),
-    total_spend = sum(spend, na.rm = TRUE),
-    n_category = n_distinct(category[category != "MISSING"]),
-    n_state = n_distinct(ship_state, na.rm = TRUE),
-    active_days = as.numeric(max(date) - min(date)) + 1,
-    prop_weekend = mean(weekend),
-    prop_missing_category = mean(category == "MISSING"),
-    n_baby = sum(baby),
-    n_toy = sum(toy),
-    .groups = "drop"
-  ) |>
- mutate(
-    log_n_purchase = log1p(n_purchase),
-    log_total_spend = log1p(total_spend),
-    log_n_category = log1p(n_category),
-    log_active_days = log1p(active_days),
-    log_n_baby = log1p(n_baby),
-    log_n_toy = log1p(n_toy)
-  ) |>
-  select(
-    id, log_n_purchase, log_total_spend, log_n_category,
-    log_active_days, n_state, prop_weekend, prop_missing_category,
-    log_n_baby, log_n_toy
-  )
-```
-
-## Modeling
-
-Only gender and state are observed for both the training and test survey rows.
-States with fewer than 30 training rows are combined into an `Other` group.
-
-```{r}
- survey_small <- survey |>
-  mutate(
-    id = Survey.ResponseID,
-    y = Q.amazon.use.hh.size.num,
-    gender = Q.demos.gender,
-    state = Q.demos.state
-  ) |>
-  select(id, y, gender, state, test)
-
-keep_state <- survey_small |>
-  filter(!test) |>
-  count(state) |>
-  filter(n >= 30) |>
-  pull(state)
-
-survey_small <- survey_small |>
-  mutate(
-    gender = ifelse(
-      gender %in% c("Female", "Male"),
-      as.character(gender),
-      "Other"
-    ),
-    state = ifelse(
-      state %in% keep_state,
-      as.character(state),
-      "Other"
-    ),
-    gender = factor(gender),
-    state = factor(state)
-  )
-
-feature_names <- setdiff(names(features), "id")
-
-model_data <- survey_small |>
-  left_join(features, by = "id") |>
-  mutate(across(all_of(feature_names), ~ replace_na(.x, 0)))
-
-train_data <- model_data |>
-  filter(!test) |>
-  select(-id, -test)
-
-test_data <- model_data |>
-  filter(test)
-```
-
 ## Candidate models: round 1
 
 *Note on the number of candidate models:* the assignment allows a maximum
