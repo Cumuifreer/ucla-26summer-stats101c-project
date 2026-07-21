@@ -74,7 +74,6 @@ survey |>
 
 Household size is coded as 1, 2, 3, or 4, where 4 means four or more people.
 
-```
 ## Clean the data
 
 The dataset paper studies purchases from January 2018 through October 2022 because data collection began in November 2022. Therefore, October 2022 is the last complete month covered for all participants. We will use the same end date.
@@ -174,7 +173,7 @@ train_data <- model_data |>
 test_data <- model_data |>
   filter(test)
 ```
-```
+```{r}
 dir.create("figures", showWarnings = FALSE)
 
 # Build a training-only frame that has both the raw/derived features and
@@ -729,11 +728,189 @@ model_results_v2 |>
   )
 ```
 
-XGBoost v2 has the lowest CV RMSE and is selected as our final model.
+XGBoost v2 has the lowest CV RMSE among the models considered so far.
+I want to try a final set of features designed for XGBoost.
+
+## Candidate models: round 4
+
+My plan is to add a final set of time-based, daily purchasing, and category features for XGBoost.
+
+### Time-based features
+
+```{r}
+end_date <- as.Date("2022-10-31")
+start_12 <- as.Date("2021-11-01")
+start_past_12 <- as.Date("2020-11-01")
+
+time_features_v3 <- purchases |>
+  mutate(
+    recent_12 = date >= start_12,
+    past_12 = date >= start_past_12 & date < start_12
+  ) |>
+  group_by(id) |>
+  summarize(
+    days_since_last = as.numeric(end_date - max(date)),
+    log_n_12 = log1p(sum(recent_12)),
+    log_spend_12 = log1p(sum(spend[recent_12], na.rm = TRUE)),
+    purchase_change_12 = log1p(sum(recent_12)) - log1p(sum(past_12)),
+    spend_change_12 = log1p(sum(spend[recent_12], na.rm = TRUE)) - log1p(sum(spend[past_12], na.rm = TRUE)),
+    .groups = "drop"
+  )
+```
+
+### Daily purchasing features
+
+```{r}
+day_features_v3 <- purchases |>
+  group_by(id, date) |>
+  summarize(
+    day_purchase = n(),
+    day_spend = sum(spend, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  group_by(id) |>
+  summarize(
+    log_max_day_purchase = log1p(max(day_purchase)),
+    mean_day_purchase = mean(day_purchase),
+    prop_multi_day = mean(day_purchase > 1),
+    log_sd_day_purchase = log1p(sd(day_purchase)),
+    log_sd_day_spend = log1p(sd(day_spend)),
+    .groups = "drop"
+  )
+```
+
+### Child and category features
+
+```{r}
+group_features_v3 <- purchases |>
+  mutate(
+    infant = str_detect(
+      category,
+      "DIAPER|PACIFIER|TEETHER|BREAST_PUMP|BOTTLE_NIPPLE|STROLLER|CRIB|INFANT_TODDLER_CAR_SEAT|BABY_SEAT|BABY_FOOD"
+    ),
+    child_play = str_detect(
+      category,
+      "TOY_FIGURE|TOY_BUILDING_BLOCK|PRETEND_PLAY_TOY|DOLL|FIDGET_TOY|TOY_VEHICLE|TOYS_AND_GAMES"
+    ),
+    child_wear = category %in% c(
+      "COSTUME_OUTFIT", "PAJAMAS", "SWIMWEAR", "BACKPACK"
+    )
+  ) |>
+  group_by(id) |>
+  summarize(
+    log_n_infant = log1p(sum(infant)),
+    prop_infant = mean(infant),
+    log_n_child_play = log1p(sum(child_play)),
+    prop_child_play = mean(child_play),
+    log_n_child_wear = log1p(sum(child_wear)),
+    prop_child_wear = mean(child_wear),
+    .groups = "drop"
+  )
+
+keep_category_v3 <- purchases |>
+  distinct(id, category) |>
+  count(category) |>
+  filter(n >= 500) |>
+  pull(category)
+
+category_features_v3 <- purchases |>
+  filter(category %in% keep_category_v3) |>
+  count(id, category) |>
+  mutate(
+    category = paste0("cat_", category),
+    n = log1p(n)
+  ) |>
+  pivot_wider(
+    names_from = category,
+    values_from = n,
+    values_fill = 0
+  )
+```
+
+### Data merge
+
+```{r}
+features_v3 <- time_features_v3 |>
+  left_join(day_features_v3, by = "id") |>
+  left_join(group_features_v3, by = "id") |>
+  left_join(category_features_v3, by = "id")
+
+v3_names <- setdiff(names(features_v3), "id")
+
+model_data_v3 <- model_data_v2 |>
+  left_join(features_v3, by = "id") |>
+  mutate(across(all_of(v3_names), ~ replace_na(.x, 0)))
+
+train_data_v3 <- model_data_v3 |>
+  filter(!test) |>
+  select(-id, -test)
+```
+
+### XGBoost v3 model
+
+```{r}
+xgb_fit_v3 <- as_learner(
+  po("encode", method = "one-hot") %>>%
+    lrn(
+      "regr.xgboost",
+      max_depth = 3,
+      eta = 0.01,
+      nrounds = 1000,
+      min_child_weight = 30,
+      subsample = 0.80,
+      colsample_bytree = 0.75,
+      lambda = 15,
+      alpha = 0.5
+    )
+)
+
+set.seed(101)
+
+v3_cv_error <- rep(NA, k)
+
+for (i in 1:k) {
+  train_id <- cv_10fold$train_set(i)
+  valid_id <- cv_10fold$test_set(i)
+
+  train_fold_v3 <- train_data_v3[train_id, ]
+  valid_fold_v3 <- train_data_v3[valid_id, ]
+  train_task_v3 <- as_task_regr(train_fold_v3, target = "y")
+
+  xgb_fit_v3$train(task = train_task_v3)
+  xgb_pred_v3 <- xgb_fit_v3$predict_newdata(
+    newdata = valid_fold_v3
+  )$response
+
+  v3_cv_error[i] <- rmse(valid_fold_v3$y, xgb_pred_v3)
+}
+```
+
+```{r}
+xgb_names <- c("XGBoost v2", "XGBoost v3")
+
+xgb_results <- data.frame(
+  model = factor(xgb_names, levels = xgb_names),
+  rmse = round(c(v2_rmse[5], mean(v3_cv_error)), 6)
+)
+
+xgb_results
+```
+
+```{r}
+xgb_results |>
+  ggplot(aes(x = model, y = rmse)) +
+  geom_col(fill = "steelblue") +
+  coord_cartesian(ylim = c(1, max(xgb_results$rmse) + 0.01)) +
+  labs(
+    x = NULL,
+    y = "10-fold CV RMSE",
+    title = "Model comparison (round 4)"
+  )
+```
+
+XGBoost v3 win the game!
 
 ## Candidate model summary table
-
-
 
 ```{r}
 candidate_model_table <- tibble::tribble(
@@ -770,15 +947,21 @@ candidate_model_table <- tibble::tribble(
     "Default ranger settings; importance = impurity",
   "XGBoost v2", "Gradient boosted trees (xgboost, one-hot encoded)",
     "gender, state, full feature set (round 1 + round 2)",
-    "max_depth = 2, eta = 0.01, nrounds = 1000, min_child_weight = 30, subsample = 0.75, colsample_bytree = 0.65, lambda = 15, alpha = 0.5"
+    "max_depth = 2, eta = 0.01, nrounds = 1000, min_child_weight = 30, subsample = 0.75, colsample_bytree = 0.65, lambda = 15, alpha = 0.5",
+  "XGBoost v3", "Gradient boosted trees (xgboost, one-hot encoded)",
+    "gender, state, full feature set with round 4 features",
+    "max_depth = 3, eta = 0.01, nrounds = 1000, min_child_weight = 30, subsample = 0.80, colsample_bytree = 0.75, lambda = 15, alpha = 0.5"
 )
 
 candidate_model_table
 ```
+
+```{r}
 performance_table <- bind_rows(
   cv_results |> filter(model != "Baseline (reference only)"),
   model_results |> filter(model != "GAM"),
-  model_results_v2 |> filter(model != "GAM")
+  model_results_v2 |> filter(model != "GAM"),
+  xgb_results |> filter(model == "XGBoost v3")
 ) |>
   distinct(model, .keep_all = TRUE)
 
@@ -800,10 +983,10 @@ performance_table |>
 ### Variable importance
 
 ```{r}
-final_task <- as_task_regr(train_data_v2, target = "y")
-xgb_fit_v2$train(task = final_task)
+final_task <- as_task_regr(train_data_v3, target = "y")
+xgb_fit_v3$train(task = final_task)
 
-trained_xgb <- xgb_fit_v2$base_learner()
+trained_xgb <- xgb_fit_v3$base_learner()
 importance_vec <- trained_xgb$importance()
 
 importance_vec |>
@@ -815,22 +998,22 @@ importance_vec |>
   labs(
     x = NULL,
     y = "Relative importance (gain)",
-    title = "Top 10 most important predictors, final XGBoost v2 model"
+    title = "Top 10 most important predictors, final XGBoost v3 model"
   )
 ```
 
 ### Individual prediction examples
 
 ```{r}
-test_data_v2 <- model_data_v2 |>
+test_data_v3 <- model_data_v3 |>
   filter(test) |>
   select(-y)
 
-test_prediction <- xgb_fit_v2$predict_newdata(
-  newdata = test_data_v2 |> select(-id, -test)
+test_prediction <- xgb_fit_v3$predict_newdata(
+  newdata = test_data_v3 |> select(-id, -test)
 )$response
 
-example_ids <- test_data_v2 |>
+example_ids <- test_data_v3 |>
   mutate(prediction = test_prediction) |>
   slice(1:3)
 
@@ -844,7 +1027,7 @@ example_ids |>
 
 ```{r}
 prediction_lookup <- tibble(
-  id = test_data_v2$id,
+  id = test_data_v3$id,
   predicted_hh_size = test_prediction
 )
 
