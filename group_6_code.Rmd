@@ -33,6 +33,7 @@ col_select = c(
     "Quantity",
     "Shipping Address State",
     "Category",
+    "ASIN/ISBN (Product Code)",
     "Survey ResponseID"
   )
 
@@ -45,6 +46,7 @@ purchases <- read_csv(
     Quantity = col_double(),
     `Shipping Address State` = col_character(),
     Category = col_character(),
+    `ASIN/ISBN (Product Code)` = col_character(),
     `Survey ResponseID` = col_character()
   )
 ) |>
@@ -54,27 +56,12 @@ purchases <- read_csv(
     quantity = Quantity,
     ship_state = `Shipping Address State`,
     category = Category,
+    product = `ASIN/ISBN (Product Code)`,
     id = `Survey ResponseID`
   )
 ```
 
-## Explore the data
-
-```{r}
-survey |>
-  filter(!test) |>
-  ggplot(aes(x = factor(Q.amazon.use.hh.size.num))) +
-  geom_bar(fill = "steelblue") +
-  labs(
-    x = "Household size",
-    y = "Number of people",
-    title = "Training response"
-  )
-```
-
-Household size is coded as 1, 2, 3, or 4, where 4 means four or more people.
-
-## Clean the data
+## Data Cleaning & Feature Selection
 
 The dataset paper studies purchases from January 2018 through October 2022 because data collection began in November 2022. Therefore, October 2022 is the last complete month covered for all participants. We will use the same end date.
 
@@ -123,7 +110,7 @@ features <- purchases |>
   )
 ```
 
-## Modeling
+## Prepare modeling data
 
 Only gender and state are observed for both the training and test survey rows.
 States with fewer than 30 training rows are combined into an `Other` group.
@@ -173,6 +160,23 @@ train_data <- model_data |>
 test_data <- model_data |>
   filter(test)
 ```
+
+## EDA
+
+```{r}
+survey |>
+  filter(!test) |>
+  ggplot(aes(x = factor(Q.amazon.use.hh.size.num))) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    x = "Household size",
+    y = "Number of people",
+    title = "Training response"
+  )
+```
+
+Household size is coded as 1, 2, 3, or 4, where 4 means four or more people.
+
 ```{r}
 dir.create("figures", showWarnings = FALSE)
 
@@ -292,13 +296,12 @@ p9 <- eda_data |>
 ggsave("figures/fig9_category_diversity_by_hh_size.png", p9, width = 6, height = 4)
 p9
 ```
-## Candidate models: round 1
 
-*Note on the number of candidate models:* the assignment allows a maximum
-of 12 candidate models. We fit an unpenalized linear model and a GAM in
-this round; a simple mean-only baseline is computed only as an informal
-reference point in the text below and is **not** counted as one of our
-formal candidate models.
+## Candidate models
+
+### Round 1
+
+We fit an unpenalized linear model and a GAM in this round. A simple mean-only baseline is computed only as an informal reference point in the text below and is **not** counted as one of our formal candidate models.
 
 ```{r}
 lm_formula <- y ~ gender + state + log_n_purchase + log_total_spend +
@@ -377,6 +380,8 @@ cv_results |>
 
 The GAM has the smallest cross-validation RMSE.
 
+### Round 2
+
 Let's try some additional models!
 
 ```{r}
@@ -408,9 +413,6 @@ xgb_fit <- as_learner(
   po("encode", method = "one-hot") %>>% lrn("regr.xgboost")
 )
 ```
-
-
-
 
 ```{r}
 set.seed(101)
@@ -451,14 +453,14 @@ for (i in 1:k) {
 ```
 
 ```{r}
-new_model_names <- c("GAM", "Ridge", "Lasso", "Random Forest", "XGBoost")
+new_model_names <- c("Ridge", "Lasso", "GAM", "Random Forest", "XGBoost")
 
 gam_rmse <- cv_results$rmse[cv_results$model == "GAM"]
 new_rmse <- colMeans(new_cv_error)
 
 model_results <- data.frame(
   model = factor(new_model_names, levels = new_model_names),
-  rmse = round(c(gam_rmse, new_rmse), 6)
+  rmse = round(c(new_rmse[1:2], gam_rmse, new_rmse[3:4]), 6)
 )
 
 model_results
@@ -478,29 +480,13 @@ model_results |>
 
 The GAM is still the winner!
 
+### Round 3
+
 Let's try adding some new features.
 
 ```{r}
-product_features_v2 <- read_csv(
-  "amazon-purchases.csv",
-  col_select = c(
-    "Order Date", "ASIN/ISBN (Product Code)", "Survey ResponseID"
-  ),
-  col_types = cols(
-    `Order Date` = col_date(format = "%Y-%m-%d"),
-    `ASIN/ISBN (Product Code)` = col_character(),
-    `Survey ResponseID` = col_character()
-  )
-) |>
-  rename(
-    date = `Order Date`,
-    product = `ASIN/ISBN (Product Code)`,
-    id = `Survey ResponseID`
-  ) |>
-  filter(
-    date <= as.Date("2022-10-31"),
-    !is.na(product)
-  ) |>
+product_features_v2 <- purchases |>
+  filter(!is.na(product)) |>
   group_by(id) |>
   summarize(
     n_product = n_distinct(product),
@@ -577,8 +563,6 @@ train_data_v2 <- model_data_v2 |>
   filter(!test) |>
   select(-id, -test)
 ```
-
-## Candidate models: round 3 (with additional features)
 
 ```{r}
 gam_formula_v2 <- y ~ gender + state +
@@ -702,7 +686,7 @@ for (i in 1:k) {
 
 ```{r}
 v2_names <- c(
-  "GAM", "GAM v2", "Ridge v2", "Lasso v2",
+  "Ridge v2", "Lasso v2", "GAM", "GAM v2",
   "Random Forest v2", "XGBoost v2"
 )
 
@@ -710,7 +694,10 @@ v2_rmse <- colMeans(v2_cv_error)
 
 model_results_v2 <- data.frame(
   model = factor(v2_names, levels = v2_names),
-  rmse = round(c(gam_rmse, v2_rmse), 6)
+  rmse = round(
+    c(v2_rmse[2:3], gam_rmse, v2_rmse[c(1, 4, 5)]),
+    6
+  )
 )
 
 model_results_v2
@@ -731,11 +718,11 @@ model_results_v2 |>
 XGBoost v2 has the lowest CV RMSE among the models considered so far.
 I want to try a final set of features designed for XGBoost.
 
-## Candidate models: round 4
+### Round 4
 
 My plan is to add a final set of time-based, daily purchasing, and category features for XGBoost.
 
-### Time-based features
+#### Time-based features
 
 ```{r}
 end_date <- as.Date("2022-10-31")
@@ -758,7 +745,7 @@ time_features_v3 <- purchases |>
   )
 ```
 
-### Daily purchasing features
+#### Daily purchasing features
 
 ```{r}
 day_features_v3 <- purchases |>
@@ -779,7 +766,7 @@ day_features_v3 <- purchases |>
   )
 ```
 
-### Child and category features
+#### Child and category features
 
 ```{r}
 group_features_v3 <- purchases |>
@@ -827,7 +814,7 @@ category_features_v3 <- purchases |>
   )
 ```
 
-### Data merge
+#### Data merge
 
 ```{r}
 features_v3 <- time_features_v3 |>
@@ -846,7 +833,7 @@ train_data_v3 <- model_data_v3 |>
   select(-id, -test)
 ```
 
-### XGBoost v3 model
+#### XGBoost v3 model
 
 ```{r}
 xgb_fit_v3 <- as_learner(
@@ -910,7 +897,7 @@ xgb_results |>
 
 XGBoost v3 win the game!
 
-## Candidate model summary table
+### Candidate model summary
 
 ```{r}
 candidate_model_table <- tibble::tribble(
@@ -918,33 +905,33 @@ candidate_model_table <- tibble::tribble(
   "Linear regression", "OLS linear regression",
     "gender, state, purchase-history features (round 1 set)",
     "None",
-  "GAM", "Generalized additive model",
-    "gender, state, smooth terms for purchase-history features",
-    "k = 4-5 basis dimension per smooth; method = REML",
   "Ridge", "Penalized linear regression (glmnet, alpha = 0)",
     "gender, state, purchase-history features (round 1 set, one-hot encoded)",
     "lambda chosen via 10-fold internal CV over 10^(-1.5, 1.5)",
   "Lasso", "Penalized linear regression (glmnet, alpha = 1)",
     "gender, state, purchase-history features (round 1 set, one-hot encoded)",
     "lambda chosen via 10-fold internal CV over 10^(-2, 2)",
-  "Random Forest", "Random forest (ranger)",
-    "gender, state, purchase-history features (round 1 set)",
-    "Default ranger settings; importance = impurity",
-  "XGBoost", "Gradient boosted trees (xgboost, one-hot encoded)",
-    "gender, state, purchase-history features (round 1 set)",
-    "Default xgboost settings",
-  "GAM v2", "Generalized additive model",
-    "gender, state, smooth terms for round-1 + round-2 purchase-history features",
-    "k = 4-5 basis dimension per smooth; method = REML",
   "Ridge v2", "Penalized linear regression (glmnet, alpha = 0)",
     "gender, state, full feature set (round 1 + round 2, one-hot encoded)",
     "lambda chosen via 10-fold internal CV over 10^(-1.5, 1.5)",
   "Lasso v2", "Penalized linear regression (glmnet, alpha = 1)",
     "gender, state, full feature set (round 1 + round 2, one-hot encoded)",
     "lambda chosen via 10-fold internal CV over 10^(-2, 2)",
+  "GAM", "Generalized additive model",
+    "gender, state, smooth terms for purchase-history features",
+    "k = 4-5 basis dimension per smooth; method = REML",
+  "GAM v2", "Generalized additive model",
+    "gender, state, smooth terms for round-1 + round-2 purchase-history features",
+    "k = 4-5 basis dimension per smooth; method = REML",
+  "Random Forest", "Random forest (ranger)",
+    "gender, state, purchase-history features (round 1 set)",
+    "Default ranger settings; importance = impurity",
   "Random Forest v2", "Random forest (ranger)",
     "gender, state, full feature set (round 1 + round 2)",
     "Default ranger settings; importance = impurity",
+  "XGBoost", "Gradient boosted trees (xgboost, one-hot encoded)",
+    "gender, state, purchase-history features (round 1 set)",
+    "Default xgboost settings",
   "XGBoost v2", "Gradient boosted trees (xgboost, one-hot encoded)",
     "gender, state, full feature set (round 1 + round 2)",
     "max_depth = 2, eta = 0.01, nrounds = 1000, min_child_weight = 30, subsample = 0.75, colsample_bytree = 0.65, lambda = 15, alpha = 0.5",
@@ -955,6 +942,8 @@ candidate_model_table <- tibble::tribble(
 
 candidate_model_table
 ```
+
+## Model comparison
 
 ```{r}
 performance_table <- bind_rows(
@@ -967,8 +956,9 @@ performance_table <- bind_rows(
 
 performance_table
 ```
+
 ```{r}
-performance_table |>
+model_comparison_plot <- performance_table |>
   ggplot(aes(x = reorder(model, rmse), y = rmse)) +
   geom_col(fill = "steelblue") +
   coord_flip() +
@@ -977,7 +967,17 @@ performance_table |>
     y = "10-fold CV RMSE",
     title = "All candidate models: 10-fold CV RMSE"
   )
+
+ggsave(
+  "figures/model_comparison.png",
+  model_comparison_plot,
+  width = 7,
+  height = 5
+)
+
+model_comparison_plot
 ```
+
 ## Final model interpretation
 
 ### Variable importance
@@ -989,7 +989,7 @@ xgb_fit_v3$train(task = final_task)
 trained_xgb <- xgb_fit_v3$base_learner()
 importance_vec <- trained_xgb$importance()
 
-importance_vec |>
+importance_plot <- importance_vec |>
   enframe(name = "Feature", value = "Gain") |>
   slice_max(Gain, n = 10) |>
   ggplot(aes(x = reorder(Feature, Gain), y = Gain)) +
@@ -1000,6 +1000,15 @@ importance_vec |>
     y = "Relative importance (gain)",
     title = "Top 10 most important predictors, final XGBoost v3 model"
   )
+
+ggsave(
+  "figures/xgboost_variable_importance.png",
+  importance_plot,
+  width = 7,
+  height = 5
+)
+
+importance_plot
 ```
 
 ### Individual prediction examples
@@ -1022,7 +1031,7 @@ example_ids |>
 ```
 
 
-## Make the final submission
+## Submission
 
 
 ```{r}
@@ -1040,7 +1049,7 @@ submission <- submission |>
   mutate(Q.amazon.use.hh.size.num = predicted_hh_size) |>
   select(-predicted_hh_size)
 
-write_csv(submission, "group_6_submission.csv")
-
 head(submission)
+
+write_csv(submission, "group_6_submission.csv")
 ```
