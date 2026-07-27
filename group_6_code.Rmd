@@ -1011,6 +1011,88 @@ ggsave(
 importance_plot
 ```
 
+### Partial dependence plots
+
+```{r}
+library(iml)
+
+xgb_predictor <- Predictor$new(
+  model = xgb_fit_v3,
+  data = train_data_v3 |> select(-y),
+  y = train_data_v3$y
+)
+
+child_play_effect <- FeatureEffect$new(
+  xgb_predictor,
+  feature = "log_n_child_play",
+  method = "pdp"
+)
+
+child_play_pdp <- child_play_effect$plot() +
+  labs(
+    x = "log(1 + child-play purchases)",
+    title = "Partial dependence of child-play purchases"
+  ) +
+  scale_y_continuous(name = "Predicted household size")
+
+ggsave(
+  "figures/pdp_log_n_child_play.png",
+  child_play_pdp,
+  width = 7,
+  height = 5
+)
+
+child_play_pdp
+```
+
+```{r}
+toy_effect <- FeatureEffect$new(
+  xgb_predictor,
+  feature = "log_n_toy",
+  method = "pdp"
+)
+
+toy_pdp <- toy_effect$plot() +
+  labs(
+    x = "log(1 + toy purchases)",
+    title = "Partial dependence of toy purchases"
+  ) +
+  scale_y_continuous(name = "Predicted household size")
+
+ggsave(
+  "figures/pdp_log_n_toy.png",
+  toy_pdp,
+  width = 7,
+  height = 5
+)
+
+toy_pdp
+```
+
+```{r}
+active_days_effect <- FeatureEffect$new(
+  xgb_predictor,
+  feature = "log_active_days",
+  method = "pdp"
+)
+
+active_days_pdp <- active_days_effect$plot() +
+  labs(
+    x = "log(1 + active days)",
+    title = "Partial dependence of active days"
+  ) +
+  scale_y_continuous(name = "Predicted household size")
+
+ggsave(
+  "figures/pdp_log_active_days.png",
+  active_days_pdp,
+  width = 7,
+  height = 5
+)
+
+active_days_pdp
+```
+
 ### Individual prediction examples
 
 ```{r}
