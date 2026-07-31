@@ -794,6 +794,63 @@ group_features_v3 <- purchases |>
     .groups = "drop"
   )
 
+family_features_v3 <- purchases |>
+  mutate(
+    learning = str_detect(
+      category,
+      "LEARN|EDUCAT|SCHOOL|ART_CRAFT|CRAFT_|BLANK_BOOK|WRITING|PENCIL|CRAYON|MARKER"
+    ),
+    games = str_detect(
+      category,
+      "BOARD_GAME|TABLETOP_GAME|TOYS_AND_GAMES|PUZZLE"
+    ),
+    costume = str_detect(
+      category,
+      "COSTUME|PAJAMAS|BACKPACK|LUNCH_BOX"
+    ),
+    sports = str_detect(
+      category,
+      "SPORT|BICYCLE|BALL$|HELMET"
+    ),
+    video_game = str_detect(
+      category,
+      "VIDEO_GAME|CONSOLE_VIDEO|PHYSICAL_VIDEO|DOWNLOADABLE_VIDEO"
+    )
+  ) |>
+  group_by(id) |>
+  summarize(
+    log_n_learning = log1p(sum(learning)),
+    prop_learning = mean(learning),
+    log_n_games = log1p(sum(games)),
+    prop_games = mean(games),
+    log_n_costume = log1p(sum(costume)),
+    prop_costume = mean(costume),
+    log_n_sports = log1p(sum(sports)),
+    prop_sports = mean(sports),
+    log_n_video_game = log1p(sum(video_game)),
+    prop_video_game = mean(video_game),
+    .groups = "drop"
+  )
+
+week_features_v3 <- purchases |>
+  mutate(week = cut(date, "week")) |>
+  group_by(id, week) |>
+  summarize(
+    week_n = n(),
+    week_spend = sum(spend, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  group_by(id) |>
+  summarize(
+    log_active_weeks = log1p(n()),
+    log_max_week_n = log1p(max(week_n)),
+    mean_week_n = mean(week_n),
+    prop_multi_week = mean(week_n > 1),
+    log_sd_week_n = log1p(sd(week_n)),
+    log_sd_week_spend = log1p(sd(week_spend)),
+    .groups = "drop"
+  )
+
 keep_category_v3 <- purchases |>
   distinct(id, category) |>
   count(category) |>
@@ -812,6 +869,80 @@ category_features_v3 <- purchases |>
     values_from = n,
     values_fill = 0
   )
+
+keep_product_v3 <- purchases |>
+  filter(!is.na(product)) |>
+  distinct(id, product) |>
+  count(product) |>
+  filter(n >= 50) |>
+  pull(product)
+
+product_names_v3 <- tibble(
+  product = keep_product_v3,
+  product_name = paste0("prod50_", seq_along(keep_product_v3))
+)
+
+product_features_v3 <- purchases |>
+  filter(product %in% keep_product_v3) |>
+  count(id, product) |>
+  left_join(product_names_v3, by = "product") |>
+  select(-product) |>
+  mutate(n = log1p(n)) |>
+  pivot_wider(
+    names_from = product_name,
+    values_from = n,
+    values_fill = 0
+  )
+
+category_value_v3 <- purchases |>
+  filter(category %in% keep_category_v3) |>
+  group_by(id, category) |>
+  summarize(
+    category_quantity = sum(quantity, na.rm = TRUE),
+    category_spend = sum(spend, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    category_quantity = log1p(category_quantity),
+    category_spend = log1p(category_spend)
+  )
+
+category_quantity_v3 <- category_value_v3 |>
+  select(id, category, n = category_quantity) |>
+  mutate(category = paste0("catq_", category)) |>
+  pivot_wider(
+    names_from = category,
+    values_from = n,
+    values_fill = 0
+  )
+
+category_spend_v3 <- category_value_v3 |>
+  select(id, category, n = category_spend) |>
+  mutate(category = paste0("cats_", category)) |>
+  pivot_wider(
+    names_from = category,
+    values_from = n,
+    values_fill = 0
+  )
+
+keep_more_category_v3 <- purchases |>
+  distinct(id, category) |>
+  count(category) |>
+  filter(n >= 250, n < 500) |>
+  pull(category)
+
+more_category_features_v3 <- purchases |>
+  filter(category %in% keep_more_category_v3) |>
+  count(id, category) |>
+  mutate(
+    category = paste0("more_cat_", category),
+    n = log1p(n)
+  ) |>
+  pivot_wider(
+    names_from = category,
+    values_from = n,
+    values_fill = 0
+  )
 ```
 
 #### Data merge
@@ -820,7 +951,13 @@ category_features_v3 <- purchases |>
 features_v3 <- time_features_v3 |>
   left_join(day_features_v3, by = "id") |>
   left_join(group_features_v3, by = "id") |>
-  left_join(category_features_v3, by = "id")
+  left_join(category_features_v3, by = "id") |>
+  left_join(product_features_v3, by = "id") |>
+  left_join(family_features_v3, by = "id") |>
+  left_join(week_features_v3, by = "id") |>
+  left_join(category_quantity_v3, by = "id") |>
+  left_join(category_spend_v3, by = "id") |>
+  left_join(more_category_features_v3, by = "id")
 
 v3_names <- setdiff(names(features_v3), "id")
 
@@ -984,6 +1121,8 @@ model_comparison_plot
 
 ```{r}
 final_task <- as_task_regr(train_data_v3, target = "y")
+
+set.seed(101)
 xgb_fit_v3$train(task = final_task)
 
 trained_xgb <- xgb_fit_v3$base_learner()
